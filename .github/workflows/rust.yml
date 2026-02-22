@@ -1,0 +1,76 @@
+name: Build Android .so
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        target:
+          - aarch64-linux-android      # arm64-v8a
+          - armv7-linux-androideabi    # armeabi-v7a
+          - i686-linux-android         # x86
+          - x86_64-linux-android       # x86_64
+        include:
+          - target: aarch64-linux-android
+            arch: arm64-v8a
+          - target: armv7-linux-androideabi
+            arch: armeabi-v7a
+          - target: i686-linux-android
+            arch: x86
+          - target: x86_64-linux-android
+            arch: x86_64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Install Android NDK
+      run: |
+        wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+        unzip -q android-ndk-r26d-linux.zip
+        echo "NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+
+    - name: Set up cross-compilation environment
+      run: |
+        case "${{ matrix.target }}" in
+          aarch64-linux-android)
+            CLANG_TRIPLE="aarch64-linux-android21"
+            ;;
+          armv7-linux-androideabi)
+            CLANG_TRIPLE="armv7a-linux-androideabi21"
+            ;;
+          i686-linux-android)
+            CLANG_TRIPLE="i686-linux-android21"
+            ;;
+          x86_64-linux-android)
+            CLANG_TRIPLE="x86_64-linux-android21"
+            ;;
+        esac
+        echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr '[:lower:]' '[:upper:]' | tr - _)_LINKER=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${CLANG_TRIPLE}-clang" >> $GITHUB_ENV
+        echo "CC_${{ matrix.target }}=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${CLANG_TRIPLE}-clang" >> $GITHUB_ENV
+        echo "AR_${{ matrix.target }}=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> $GITHUB_ENV
+
+    - name: Build for ${{ matrix.target }}
+      run: cargo build --release --target ${{ matrix.target }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: libarb_inspector-${{ matrix.arch }}.so
+        path: target/${{ matrix.target }}/release/libarb_inspector.so
