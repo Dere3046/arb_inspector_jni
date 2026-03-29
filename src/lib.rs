@@ -5,7 +5,6 @@ use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jobject};
 use jni::JNIEnv;
 
-// ELF constants
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
@@ -13,89 +12,412 @@ const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
-// Program header constants (not used directly, kept for completeness)
-#[allow(dead_code)]
+const PT_NULL: u32 = 0;
 const PT_LOAD: u32 = 1;
-#[allow(dead_code)]
 const PT_NOTE: u32 = 4;
 
-// Hash segment constants (Qualcomm extension)
+const ELF32_HDR_SIZE: usize = 52;
+const ELF64_HDR_SIZE: usize = 64;
+const ELF32_PHDR_SIZE: usize = 32;
+const ELF64_PHDR_SIZE: usize = 56;
+
 const HASH_TABLE_HEADER_SIZE: usize = 40;
 const OS_TYPE_HASH: u32 = 2;
 
-// MBN constants
+const VERSION_MIN: u32 = 1;
+const VERSION_MAX: u32 = 1000;
+const COMMON_SIZE_MAX: usize = 0x1000;
+const QTI_SIZE_MAX: usize = 0x1000;
+const OEM_SIZE_MAX: usize = 0x4000;
+const HASH_TABLE_SIZE_MAX: usize = 0x10000;
+const ARB_VALUE_MAX: u32 = 127;
+
 const MBN_HDR_SIZE: usize = 40;
 const MBN_V7_HDR_SIZE: usize = 64;
 const MBN_V8_HDR_SIZE: usize = 80;
 
-// Default config values
-const DEFAULT_MAX_SEGMENT_BYTES: u64 = 20 * 1024 * 1024;
-const DEFAULT_VERSION_MIN: u32 = 1;
-const DEFAULT_VERSION_MAX: u32 = 1000;
-const DEFAULT_COMMON_SIZE_MAX: usize = 0x1000;
-const DEFAULT_QTI_SIZE_MAX: usize = 0x1000;
-const DEFAULT_OEM_SIZE_MAX: usize = 0x4000;
-const DEFAULT_HASH_TABLE_SIZE_MAX: usize = 0x10000;
-const DEFAULT_ARB_VALUE_MAX: u32 = 127;
-
-// Configuration structure (must match Java class)
-#[derive(Clone, Copy)]
-struct Config {
-    #[allow(dead_code)]
-    hash_scan_max: usize,          // unused in current impl, kept for compatibility
-    max_segment_size: u64,
-    min_version: u32,
-    max_version: u32,
-    max_common_sz: usize,
-    max_qti_sz: usize,
-    max_oem_sz: usize,
-    max_hash_tbl_sz: usize,
-    max_arb: u32,
-    full_mode: bool,
+#[inline]
+fn read_le_u16(buf: &[u8], off: usize) -> Result<u16, &'static str> {
+    if off + 2 > buf.len() {
+        return Err("Buffer too short for u16");
+    }
+    Ok(u16::from_le_bytes([buf[off], buf[off + 1]]))
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            hash_scan_max: 0x1000,
-            max_segment_size: DEFAULT_MAX_SEGMENT_BYTES,
-            min_version: DEFAULT_VERSION_MIN,
-            max_version: DEFAULT_VERSION_MAX,
-            max_common_sz: DEFAULT_COMMON_SIZE_MAX,
-            max_qti_sz: DEFAULT_QTI_SIZE_MAX,
-            max_oem_sz: DEFAULT_OEM_SIZE_MAX,
-            max_hash_tbl_sz: DEFAULT_HASH_TABLE_SIZE_MAX,
-            max_arb: DEFAULT_ARB_VALUE_MAX,
-            full_mode: false,
+#[inline]
+fn read_le_u32(buf: &[u8], off: usize) -> Result<u32, &'static str> {
+    if off + 4 > buf.len() {
+        return Err("Buffer too short for u32");
+    }
+    Ok(u32::from_le_bytes([
+        buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
+    ]))
+}
+
+#[inline]
+fn read_le_u64(buf: &[u8], off: usize) -> Result<u64, &'static str> {
+    if off + 8 > buf.len() {
+        return Err("Buffer too short for u64");
+    }
+    Ok(u64::from_le_bytes([
+        buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
+        buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
+    ]))
+}
+
+trait ElfHeaderTrait {
+    fn e_entry(&self) -> u64;
+    fn e_phoff(&self) -> u64;
+    fn e_phentsize(&self) -> u16;
+    fn e_phnum(&self) -> u16;
+}
+
+struct Elf32Header {
+    e_entry: u32,
+    e_phoff: u32,
+    e_phentsize: u16,
+    e_phnum: u16,
+}
+
+impl Elf32Header {
+    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < ELF32_HDR_SIZE {
+            return Err("Insufficient data for ELF32 header");
+        }
+        Ok(Self {
+            e_entry: read_le_u32(data, 24)?,
+            e_phoff: read_le_u32(data, 28)?,
+            e_phentsize: read_le_u16(data, 42)?,
+            e_phnum: read_le_u16(data, 44)?,
+        })
+    }
+}
+
+impl ElfHeaderTrait for Elf32Header {
+    fn e_entry(&self) -> u64 { self.e_entry as u64 }
+    fn e_phoff(&self) -> u64 { self.e_phoff as u64 }
+    fn e_phentsize(&self) -> u16 { self.e_phentsize }
+    fn e_phnum(&self) -> u16 { self.e_phnum }
+}
+
+struct Elf64Header {
+    e_entry: u64,
+    e_phoff: u64,
+    e_phentsize: u16,
+    e_phnum: u16,
+}
+
+impl Elf64Header {
+    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < ELF64_HDR_SIZE {
+            return Err("Insufficient data for ELF64 header");
+        }
+        Ok(Self {
+            e_entry: read_le_u64(data, 24)?,
+            e_phoff: read_le_u64(data, 32)?,
+            e_phentsize: read_le_u16(data, 54)?,
+            e_phnum: read_le_u16(data, 56)?,
+        })
+    }
+}
+
+impl ElfHeaderTrait for Elf64Header {
+    fn e_entry(&self) -> u64 { self.e_entry }
+    fn e_phoff(&self) -> u64 { self.e_phoff }
+    fn e_phentsize(&self) -> u16 { self.e_phentsize }
+    fn e_phnum(&self) -> u16 { self.e_phnum }
+}
+
+trait ProgramHeaderTrait {
+    fn p_type(&self) -> u32;
+    fn p_flags(&self) -> u32;
+    fn p_offset(&self) -> u64;
+    fn p_vaddr(&self) -> u64;
+    fn p_filesz(&self) -> u64;
+}
+
+struct Elf32ProgramHeader {
+    p_type: u32,
+    p_offset: u32,
+    p_vaddr: u32,
+    p_filesz: u32,
+    p_flags: u32,
+}
+
+impl Elf32ProgramHeader {
+    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < ELF32_PHDR_SIZE {
+            return Err("Insufficient data for ELF32 program header");
+        }
+        Ok(Self {
+            p_type: read_le_u32(data, 0)?,
+            p_offset: read_le_u32(data, 4)?,
+            p_vaddr: read_le_u32(data, 8)?,
+            p_filesz: read_le_u32(data, 16)?,
+            p_flags: read_le_u32(data, 24)?,
+        })
+    }
+}
+
+impl ProgramHeaderTrait for Elf32ProgramHeader {
+    fn p_type(&self) -> u32 { self.p_type }
+    fn p_flags(&self) -> u32 { self.p_flags }
+    fn p_offset(&self) -> u64 { self.p_offset as u64 }
+    fn p_vaddr(&self) -> u64 { self.p_vaddr as u64 }
+    fn p_filesz(&self) -> u64 { self.p_filesz as u64 }
+}
+
+struct Elf64ProgramHeader {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+}
+
+impl Elf64ProgramHeader {
+    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < ELF64_PHDR_SIZE {
+            return Err("Insufficient data for ELF64 program header");
+        }
+        Ok(Self {
+            p_type: read_le_u32(data, 0)?,
+            p_flags: read_le_u32(data, 4)?,
+            p_offset: read_le_u64(data, 8)?,
+            p_vaddr: read_le_u64(data, 16)?,
+            p_filesz: read_le_u64(data, 32)?,
+        })
+    }
+}
+
+impl ProgramHeaderTrait for Elf64ProgramHeader {
+    fn p_type(&self) -> u32 { self.p_type }
+    fn p_flags(&self) -> u32 { self.p_flags }
+    fn p_offset(&self) -> u64 { self.p_offset }
+    fn p_vaddr(&self) -> u64 { self.p_vaddr }
+    fn p_filesz(&self) -> u64 { self.p_filesz }
+}
+
+enum ElfFormat {
+    Elf32(Elf32Header, Vec<Elf32ProgramHeader>),
+    Elf64(Elf64Header, Vec<Elf64ProgramHeader>),
+}
+
+struct Elf {
+    format: ElfFormat,
+}
+
+impl Elf {
+    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < 16 || &data[0..4] != ELF_MAGIC {
+            return Err("Invalid ELF magic");
+        }
+        match data[EI_CLASS] {
+            ELFCLASS32 => {
+                let header = Elf32Header::from_bytes(data)?;
+                let phoff = header.e_phoff as usize;
+                let phnum = header.e_phnum as usize;
+                let phentsize = header.e_phentsize as usize;
+
+                let mut phdrs = Vec::with_capacity(phnum);
+                for i in 0..phnum {
+                    let offset = phoff + i * phentsize;
+                    if offset + phentsize <= data.len() {
+                        if let Ok(ph) = Elf32ProgramHeader::from_bytes(&data[offset..offset + phentsize]) {
+                            phdrs.push(ph);
+                        }
+                    }
+                }
+
+                Ok(Self {
+                    format: ElfFormat::Elf32(header, phdrs),
+                })
+            }
+            ELFCLASS64 => {
+                let header = Elf64Header::from_bytes(data)?;
+                let phoff = header.e_phoff as usize;
+                let phnum = header.e_phnum as usize;
+                let phentsize = header.e_phentsize as usize;
+
+                let mut phdrs = Vec::with_capacity(phnum);
+                for i in 0..phnum {
+                    let offset = phoff + i * phentsize;
+                    if offset + phentsize <= data.len() {
+                        if let Ok(ph) = Elf64ProgramHeader::from_bytes(&data[offset..offset + phentsize]) {
+                            phdrs.push(ph);
+                        }
+                    }
+                }
+
+                Ok(Self {
+                    format: ElfFormat::Elf64(header, phdrs),
+                })
+            }
+            _ => Err("Unsupported ELF class"),
+        }
+    }
+
+    fn phdrs(&self) -> Vec<&dyn ProgramHeaderTrait> {
+        match &self.format {
+            ElfFormat::Elf32(_, phdrs) => phdrs.iter().map(|p| p as &dyn ProgramHeaderTrait).collect(),
+            ElfFormat::Elf64(_, phdrs) => phdrs.iter().map(|p| p as &dyn ProgramHeaderTrait).collect(),
+        }
+    }
+
+    fn elf_header(&self) -> Option<&dyn ElfHeaderTrait> {
+        match &self.format {
+            ElfFormat::Elf32(h, _) => Some(h),
+            ElfFormat::Elf64(h, _) => Some(h),
+        }
+    }
+
+    fn elf_class(&self) -> u8 {
+        match &self.format {
+            ElfFormat::Elf32(_, _) => ELFCLASS32,
+            ElfFormat::Elf64(_, _) => ELFCLASS64,
         }
     }
 }
 
-// -----------------------------------------------------------------------------
-// Little‑endian helpers
-// -----------------------------------------------------------------------------
-#[inline]
-fn read_le_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
-}
-#[inline]
-fn read_le_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
-}
-#[inline]
-fn read_le_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+#[derive(Clone)]
+struct HashTableSegmentHeader {
+    version: u32,
+    common_metadata_size: u32,
+    qti_metadata_size: u32,
+    oem_metadata_size: u32,
+    hash_table_size: u32,
 }
 
-// -----------------------------------------------------------------------------
-// MBN structures
-// -----------------------------------------------------------------------------
-#[allow(dead_code)]
+impl HashTableSegmentHeader {
+    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < HASH_TABLE_HEADER_SIZE {
+            return Err("Insufficient data for hash table header");
+        }
+        Ok(Self {
+            version: read_le_u32(data, 4)?,
+            common_metadata_size: read_le_u32(data, 8)?,
+            qti_metadata_size: read_le_u32(data, 12)?,
+            oem_metadata_size: read_le_u32(data, 16)?,
+            hash_table_size: read_le_u32(data, 20)?,
+        })
+    }
+
+    fn get_arb_version(&self, oem_metadata: &[u8]) -> Option<u32> {
+        if oem_metadata.len() >= 12 {
+            read_le_u32(oem_metadata, 8).ok()
+        } else {
+            None
+        }
+    }
+
+    fn is_plausible(&self) -> bool {
+        let common_sz = self.common_metadata_size as usize;
+        let qti_sz = self.qti_metadata_size as usize;
+        let oem_sz = self.oem_metadata_size as usize;
+        let hash_sz = self.hash_table_size as usize;
+
+        (VERSION_MIN..=VERSION_MAX).contains(&self.version)
+            && common_sz <= COMMON_SIZE_MAX
+            && qti_sz <= QTI_SIZE_MAX
+            && oem_sz <= OEM_SIZE_MAX
+            && hash_sz > 0
+            && hash_sz <= HASH_TABLE_SIZE_MAX
+    }
+}
+
+struct ElfWithHashTableSegment {
+    elf: Elf,
+    hash_table_header: Option<HashTableSegmentHeader>,
+    oem_metadata: Vec<u8>,
+}
+
+impl ElfWithHashTableSegment {
+    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        let elf = Elf::from_bytes(data)?;
+
+        let mut hash_table_header = None;
+        let mut oem_metadata = Vec::new();
+
+        if let Some(header) = elf.elf_header() {
+            let phoff = header.e_phoff();
+            let phnum = header.e_phnum();
+            let phentsize = header.e_phentsize();
+
+            for i in 0..phnum {
+                let phdr_offset = (phoff + (i as u64) * (phentsize as u64)) as usize;
+                if phdr_offset + (phentsize as usize) > data.len() {
+                    continue;
+                }
+
+                let (p_flags_off, p_offset_off, p_filesz_off) = match elf.elf_class() {
+                    ELFCLASS32 => (24, 4, 16),
+                    ELFCLASS64 => (4, 8, 32),
+                    _ => unreachable!(),
+                };
+
+                if phdr_offset + p_flags_off + 4 > data.len() {
+                    continue;
+                }
+                let p_flags = match read_le_u32(data, phdr_offset + p_flags_off) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let os_type = (p_flags >> 24) & 0x7;
+
+                if os_type == OS_TYPE_HASH {
+                    if phdr_offset + p_offset_off + 8 > data.len() {
+                        continue;
+                    }
+                    let p_offset = match elf.elf_class() {
+                        ELFCLASS32 => read_le_u32(data, phdr_offset + p_offset_off).map(|v| v as usize),
+                        ELFCLASS64 => read_le_u64(data, phdr_offset + p_offset_off).map(|v| v as usize),
+                        _ => unreachable!(),
+                    };
+                    let p_filesz = match elf.elf_class() {
+                        ELFCLASS32 => read_le_u32(data, phdr_offset + p_filesz_off).map(|v| v as usize),
+                        ELFCLASS64 => read_le_u64(data, phdr_offset + p_filesz_off).map(|v| v as usize),
+                        _ => unreachable!(),
+                    };
+                    if let (Ok(p_offset), Ok(p_filesz)) = (p_offset, p_filesz) {
+                        if p_offset + p_filesz <= data.len() && p_filesz >= HASH_TABLE_HEADER_SIZE {
+                            if let Ok(ht) = HashTableSegmentHeader::from_bytes(&data[p_offset..p_offset + HASH_TABLE_HEADER_SIZE]) {
+                                if ht.is_plausible() {
+                                    hash_table_header = Some(ht.clone());
+
+                                    let common_start = p_offset + HASH_TABLE_HEADER_SIZE;
+                                    let oem_start = common_start + ht.common_metadata_size as usize;
+
+                                    if oem_start + ht.oem_metadata_size as usize <= data.len() {
+                                        oem_metadata = data[oem_start..oem_start + ht.oem_metadata_size as usize].to_vec();
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            elf,
+            hash_table_header,
+            oem_metadata,
+        })
+    }
+
+    fn get_arb_version(&self) -> Option<u32> {
+        if let Some(ref header) = self.hash_table_header {
+            header.get_arb_version(&self.oem_metadata)
+        } else {
+            None
+        }
+    }
+}
+
 struct MbnHeader {
     image_id: u32,
     version: u32,
-    image_src: u32,
-    image_dest_ptr: u32,
     image_size: u32,
     code_size: u32,
     sig_ptr: u32,
@@ -110,16 +432,14 @@ impl MbnHeader {
             return Err("Insufficient data for MBN header");
         }
         Ok(Self {
-            image_id: read_le_u32(data, 0),
-            version: read_le_u32(data, 4),
-            image_src: read_le_u32(data, 8),
-            image_dest_ptr: read_le_u32(data, 12),
-            image_size: read_le_u32(data, 16),
-            code_size: read_le_u32(data, 20),
-            sig_ptr: read_le_u32(data, 24),
-            sig_size: read_le_u32(data, 28),
-            cert_chain_ptr: read_le_u32(data, 32),
-            cert_chain_size: read_le_u32(data, 36),
+            image_id: read_le_u32(data, 0)?,
+            version: read_le_u32(data, 4)?,
+            image_size: read_le_u32(data, 16)?,
+            code_size: read_le_u32(data, 20)?,
+            sig_ptr: read_le_u32(data, 24)?,
+            sig_size: read_le_u32(data, 28)?,
+            cert_chain_ptr: read_le_u32(data, 32)?,
+            cert_chain_size: read_le_u32(data, 36)?,
         })
     }
 
@@ -134,7 +454,6 @@ impl MbnHeader {
 
 struct Mbn {
     header: MbnHeader,
-    _code: Vec<u8>,
 }
 
 impl Mbn {
@@ -147,410 +466,416 @@ impl Mbn {
         if data.len() < header_size {
             return Err("Insufficient data for MBN with padding");
         }
-        let code = data[header_size..].to_vec();
-        Ok(Self { header, _code: code })
+        Ok(Self { header })
     }
 }
 
-// -----------------------------------------------------------------------------
-// ELF program header reader
-// -----------------------------------------------------------------------------
-fn read_program_header(
-    file: &mut File,
-    offset: u64,
-    class: u8,
-) -> Result<(u32, u64, u64, u32), std::io::Error> {
-    let size = if class == ELFCLASS32 { 32 } else { 56 };
-    let mut buf = vec![0u8; size];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut buf)?;
+enum FileType {
+    Elf,
+    Mbn,
+    Unknown,
+}
 
-    if class == ELFCLASS32 {
-        let p_type = read_le_u32(&buf, 0);
-        let p_offset = read_le_u32(&buf, 4) as u64;
-        let p_filesz = read_le_u32(&buf, 16) as u64;
-        let p_flags = read_le_u32(&buf, 24);
-        Ok((p_type, p_offset, p_filesz, p_flags))
+fn detect_file_type(data: &[u8]) -> FileType {
+    if data.starts_with(ELF_MAGIC) {
+        FileType::Elf
+    } else if data.len() >= 8 {
+        if let Ok(version) = read_le_u32(data, 4) {
+            if [3, 5, 6, 7, 8].contains(&version) {
+                return FileType::Mbn;
+            }
+        }
+        FileType::Unknown
     } else {
-        let p_type = read_le_u32(&buf, 0);
-        let p_offset = read_le_u64(&buf, 8);
-        let p_filesz = read_le_u64(&buf, 32);
-        let p_flags = read_le_u32(&buf, 4);
-        Ok((p_type, p_offset, p_filesz, p_flags))
+        FileType::Unknown
     }
 }
 
-// -----------------------------------------------------------------------------
-// Parse hash table header (Qualcomm)
-// -----------------------------------------------------------------------------
-fn parse_hash_header(data: &[u8], config: &Config) -> Option<(usize, usize, usize)> {
-    if data.len() < HASH_TABLE_HEADER_SIZE {
-        return None;
-    }
-    let version = read_le_u32(data, 4);
-    let common_sz = read_le_u32(data, 8) as usize;
-    let qti_sz = read_le_u32(data, 12) as usize;
-    let oem_sz = read_le_u32(data, 16) as usize;
-    let hash_tbl_sz = read_le_u32(data, 20) as usize;
-
-    if !(config.min_version..=config.max_version).contains(&version) {
-        return None;
-    }
-    if common_sz > config.max_common_sz
-        || qti_sz > config.max_qti_sz
-        || oem_sz > config.max_oem_sz
-        || hash_tbl_sz == 0
-        || hash_tbl_sz > config.max_hash_tbl_sz
-    {
-        return None;
-    }
-    Some((common_sz, qti_sz, oem_sz))
+struct ExtractionResult {
+    major: u32,
+    minor: u32,
+    arb: u32,
+    messages: Vec<String>,
 }
 
-// -----------------------------------------------------------------------------
-// Core extraction logic (supports ELF and MBN, quick/full modes)
-// -----------------------------------------------------------------------------
-fn extract_metadata(
-    path: &str,
-    debug: bool,
-    block_mode: bool,
-    config: &Config,
-) -> Result<(u32, u32, u32, Vec<String>), String> {
-    let mut msgs = Vec::new();
-
+fn extract_arb_from_path(path: &str, full_mode: bool, debug: bool) -> Result<ExtractionResult, String> {
     let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let file_size = file.metadata().map_err(|e| format!("Failed to get metadata: {}", e))?.len();
+    let file_size = file.metadata().map_err(|e| format!("Failed to get file size: {}", e))?.len();
+    if file_size < 64 {
+        return Err("File too small to be a valid image".into());
+    }
 
-    let mut header = [0u8; 64];
-    file.read_exact(&mut header).map_err(|e| format!("Failed to read header: {}", e))?;
+    let mut header_buf = [0u8; 64];
+    file.read_exact(&mut header_buf).map_err(|e| format!("Failed to read header: {}", e))?;
 
-    // Check ELF magic
-    if &header[0..4] == ELF_MAGIC {
-        // -------------------- ELF handling --------------------
-        if header[EI_DATA] != ELFDATA2LSB {
-            return Err("Not a little‑endian ELF file".into());
-        }
-        let elf_class = header[EI_CLASS];
-        if elf_class != ELFCLASS32 && elf_class != ELFCLASS64 {
-            return Err("Unsupported ELF class".into());
-        }
-
-        if config.full_mode {
-            msgs.push(format!("File: {}", path));
-            msgs.push(format!("Format: ELF ({})", if elf_class == ELFCLASS32 { "32-bit" } else { "64-bit" }));
-        }
-        if debug {
-            msgs.push(format!("[DEBUG] ELF class: {}", if elf_class == ELFCLASS32 { "32-bit" } else { "64-bit" }));
-        }
-
-        // Read program header table info
-        let (e_phoff, e_phentsize, e_phnum) = if elf_class == ELFCLASS32 {
-            (read_le_u32(&header, 28) as u64, read_le_u16(&header, 42) as usize, read_le_u16(&header, 44) as usize)
-        } else {
-            (read_le_u64(&header, 32), read_le_u16(&header, 54) as usize, read_le_u16(&header, 56) as usize)
-        };
-
-        if e_phnum == 0 || e_phentsize < (if elf_class == ELFCLASS32 { 32 } else { 56 }) {
-            return Err("Invalid program header table".into());
-        }
-
-        if debug {
-            msgs.push(format!("[DEBUG] Program headers: {}, table offset: 0x{:x}", e_phnum, e_phoff));
-        }
-
-        // Scan for HASH segment (os_type == 2)
-        let mut hash_seg_info = None;
-        for i in 0..e_phnum {
-            let ph_offset = e_phoff + (i as u64) * e_phentsize as u64;
-            let (p_type, p_offset, p_filesz, p_flags) =
-                read_program_header(&mut file, ph_offset, elf_class).map_err(|e| e.to_string())?;
-
-            if p_filesz == 0 {
-                continue;
+    match detect_file_type(&header_buf) {
+        FileType::Elf => {
+            if debug {
+                eprintln!("[DEBUG] Detected ELF file");
             }
 
-            if !block_mode && p_offset + p_filesz > file_size {
-                if debug {
-                    msgs.push(format!("[DEBUG] Segment {} (type {}) extends beyond file – skipping", i, p_type));
-                }
-                continue;
-            }
-            if p_filesz > config.max_segment_size {
-                if debug {
-                    msgs.push(format!("[DEBUG] Segment {} too large ({} bytes) – skipping", i, p_filesz));
-                }
-                continue;
+            if header_buf[EI_DATA] != ELFDATA2LSB {
+                return Err("Not a little-endian ELF file".into());
             }
 
-            let os_type = (p_flags >> 24) & 0x7;
-            if os_type == OS_TYPE_HASH {
-                if debug {
-                    msgs.push(format!("[DEBUG] Found HASH segment at index {}: offset 0x{:x}, size 0x{:x}", i, p_offset, p_filesz));
-                }
-                hash_seg_info = Some((p_offset, p_filesz));
-                break;
-            } else if debug {
-                msgs.push(format!("[DEBUG] Segment {}: type {}, os_type {} – not HASH", i, p_type, os_type));
-            }
-        }
-
-        let (hash_off, hash_size) = hash_seg_info.ok_or_else(|| "No HASH segment found in ELF".to_string())?;
-
-        // Read the whole HASH segment
-        let mut hash_data = vec![0u8; hash_size as usize];
-        file.seek(SeekFrom::Start(hash_off)).map_err(|e| e.to_string())?;
-        file.read_exact(&mut hash_data).map_err(|e| e.to_string())?;
-
-        // Parse hash header
-        let (common_sz, qti_sz, oem_sz) = parse_hash_header(&hash_data, config)
-            .ok_or_else(|| "Invalid HASH segment header".to_string())?;
-
-        if debug {
-            msgs.push(format!("[DEBUG] HASH header: common={}, qti={}, oem={}", common_sz, qti_sz, oem_sz));
-        }
-
-        // Locate OEM metadata (after header + common + qti)
-        let oem_off = HASH_TABLE_HEADER_SIZE + common_sz + qti_sz;
-        if oem_off + 12 > hash_data.len() {
-            return Err("OEM metadata truncated".into());
-        }
-        let oem_slice = &hash_data[oem_off..oem_off + 12];
-        let oem_major = read_le_u32(oem_slice, 0);
-        let oem_minor = read_le_u32(oem_slice, 4);
-        let oem_arb = read_le_u32(oem_slice, 8);
-
-        if oem_major > config.max_version || oem_minor > config.max_version || oem_arb > config.max_arb {
-            return Err("OEM metadata values out of expected range".into());
-        }
-
-        if config.full_mode {
-            msgs.push(format!("Entry point: 0x{:x}", if elf_class == ELFCLASS32 { read_le_u32(&header, 24) as u64 } else { read_le_u64(&header, 24) }));
-            msgs.push(format!("Program headers: {}", e_phnum));
-
-            // Re‑scan program headers to list them
-            for i in 0..e_phnum {
-                let ph_offset = e_phoff + (i as u64) * e_phentsize as u64;
-                let (p_type, p_offset, p_filesz, _) =
-                    read_program_header(&mut file, ph_offset, elf_class).map_err(|e| e.to_string())?;
-                let type_str = match p_type {
-                    0 => "NULL",
-                    1 => "LOAD",
-                    4 => "NOTE",
-                    _ => "OTHER",
-                };
-                msgs.push(format!("  [{}] Type: {} Offset: 0x{:x} VAddr: ??? FileSize: 0x{:x}", i, type_str, p_offset, p_filesz));
-            }
-
-            if hash_seg_info.is_some() {
-                msgs.push("Hash Table Segment Header:".to_string());
-                let version = read_le_u32(&hash_data, 4);
-                msgs.push(format!("  Version: {}", version));
-                msgs.push(format!("  Common Metadata Size: {}", common_sz));
-                msgs.push(format!("  OEM Metadata Size: {}", oem_sz));
-                msgs.push(format!("  Hash Table Size: {}", read_le_u32(&hash_data, 20)));
-            }
-        }
-
-        if debug {
-            msgs.push(format!("[DEBUG] OEM metadata: major={}, minor={}, arb={}", oem_major, oem_minor, oem_arb));
-        }
-
-        Ok((oem_major, oem_minor, oem_arb, msgs))
-
-    } else {
-        // -------------------- MBN detection --------------------
-        let version = read_le_u32(&header, 4);
-        if [3, 5, 6, 7, 8].contains(&version) {
-            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-            let mut full_data = Vec::new();
-            file.read_to_end(&mut full_data).map_err(|e| e.to_string())?;
-            let mbn = Mbn::from_bytes(&full_data).map_err(|e| e.to_string())?;
-
-            if config.full_mode {
-                msgs.push(format!("File: {}", path));
-                msgs.push(format!("Format: MBN v{}", mbn.header.version));
-                msgs.push(format!("Image ID: 0x{:x}", mbn.header.image_id));
-                msgs.push(format!("Code size: {} bytes", mbn.header.code_size));
-                msgs.push(format!("Image size: {} bytes", mbn.header.image_size));
-                msgs.push(format!("Signature ptr: 0x{:x}, size: {}", mbn.header.sig_ptr, mbn.header.sig_size));
-                msgs.push(format!("Certificate chain ptr: 0x{:x}, size: {}", mbn.header.cert_chain_ptr, mbn.header.cert_chain_size));
-                msgs.push("ARB: not applicable".to_string());
-            } else {
-                msgs.push("MBN format does not contain ARB field".to_string());
+            let elf_class = header_buf[EI_CLASS];
+            if elf_class != ELFCLASS32 && elf_class != ELFCLASS64 {
+                return Err("Unsupported ELF class".into());
             }
 
             if debug {
-                msgs.push(format!("[DEBUG] MBN version: {}", mbn.header.version));
-                msgs.push(format!("[DEBUG] Code size: {}", mbn.header.code_size));
+                eprintln!("[DEBUG] ELF class: {}", if elf_class == ELFCLASS32 { "32-bit" } else { "64-bit" });
             }
 
-            Ok((0, 0, 0, msgs))
-        } else {
-            Err("Unknown file format (not ELF or MBN)".into())
+            let mut full_data = Vec::new();
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            file.read_to_end(&mut full_data).map_err(|e| format!("Failed to read file: {}", e))?;
+
+            if debug {
+                eprintln!("[DEBUG] Full ELF size: {} bytes", full_data.len());
+            }
+
+            let elf_with_hash = ElfWithHashTableSegment::from_bytes(&full_data)?;
+
+            if debug {
+                if let Some(hdr) = elf_with_hash.elf.elf_header() {
+                    eprintln!("[DEBUG] ELF entry: 0x{:x}", hdr.e_entry());
+                    eprintln!("[DEBUG] Program header offset: 0x{:x}", hdr.e_phoff());
+                    eprintln!("[DEBUG] Program header count: {}", hdr.e_phnum());
+                    eprintln!("[DEBUG] Program header size: {} bytes", hdr.e_phentsize());
+                }
+
+                let phdrs = elf_with_hash.elf.phdrs();
+                for (i, ph) in phdrs.iter().enumerate() {
+                    eprintln!(
+                        "[DEBUG] PH[{}]: type={:#x} offset=0x{:x} filesz=0x{:x} flags={:#x}",
+                        i, ph.p_type(), ph.p_offset(), ph.p_filesz(), ph.p_flags()
+                    );
+                }
+            }
+
+            let arb = elf_with_hash.get_arb_version();
+
+            if debug {
+                if let Some(ht) = &elf_with_hash.hash_table_header {
+                    eprintln!("[DEBUG] Found HASH segment header:");
+                    eprintln!("[DEBUG]   version: {}", ht.version);
+                    eprintln!("[DEBUG]   common_metadata_size: {}", ht.common_metadata_size);
+                    eprintln!("[DEBUG]   oem_metadata_size: {}", ht.oem_metadata_size);
+                    eprintln!("[DEBUG]   hash_table_size: {}", ht.hash_table_size);
+                } else {
+                    eprintln!("[DEBUG] No HASH segment header found");
+                }
+
+                if let Some(arb_val) = arb {
+                    eprintln!("[DEBUG] Extracted ARB: {}", arb_val);
+                }
+            }
+
+            let mut messages = Vec::new();
+
+            if full_mode {
+                messages.push(format!("File: {}", path));
+                messages.push(format!("Format: ELF ({})", if elf_class == ELFCLASS32 { "32-bit" } else { "64-bit" }));
+                if let Some(hdr) = elf_with_hash.elf.elf_header() {
+                    messages.push(format!("Entry point: 0x{:x}", hdr.e_entry()));
+                    messages.push(format!("Program headers: {}", hdr.e_phnum()));
+                }
+
+                let phdrs = elf_with_hash.elf.phdrs();
+                for (i, phdr) in phdrs.iter().enumerate() {
+                    messages.push(format!(
+                        "  [{}] Type: {} Offset: 0x{:x} VAddr: 0x{:x} FileSize: 0x{:x}",
+                        i,
+                        match phdr.p_type() {
+                            PT_LOAD => "LOAD",
+                            PT_NULL => "NULL",
+                            PT_NOTE => "NOTE",
+                            _ => "OTHER",
+                        },
+                        phdr.p_offset(),
+                        phdr.p_vaddr(),
+                        phdr.p_filesz()
+                    ));
+                }
+
+                if let Some(ref ht) = elf_with_hash.hash_table_header {
+                    messages.push("Hash Table Segment Header:".to_string());
+                    messages.push(format!("  Version: {}", ht.version));
+                    messages.push(format!("  Common Metadata Size: {}", ht.common_metadata_size));
+                    messages.push(format!("  OEM Metadata Size: {}", ht.oem_metadata_size));
+                    messages.push(format!("  Hash Table Size: {}", ht.hash_table_size));
+                }
+
+                if let Some(arb_val) = arb {
+                    if arb_val <= ARB_VALUE_MAX {
+                        messages.push(format!("Anti-Rollback Version: {}", arb_val));
+                    } else {
+                        messages.push(format!("Warning: ARB value {} exceeds expected maximum.", arb_val));
+                        messages.push(format!("Anti-Rollback Version: {}", arb_val));
+                    }
+                } else {
+                    messages.push("Anti-Rollback Version: not present".to_string());
+                }
+            }
+
+            let (major, minor, arb_val) = if let Some(arb_val) = arb {
+                if full_mode && arb_val > ARB_VALUE_MAX {
+                    eprintln!("Warning: ARB value {} exceeds expected maximum.", arb_val);
+                }
+                (0, 0, arb_val)
+            } else {
+                if !full_mode {
+                    eprintln!("No ARB version found in the image");
+                }
+                (0, 0, 0)
+            };
+
+            if !full_mode {
+                if let Some(arb_val) = arb {
+                    if arb_val <= ARB_VALUE_MAX {
+                        println!("{}", arb_val);
+                    } else {
+                        eprintln!("Warning: ARB value {} exceeds expected maximum.", arb_val);
+                        println!("{}", arb_val);
+                    }
+                } else {
+                    eprintln!("No ARB version found in the image");
+                }
+            }
+
+            Ok(ExtractionResult {
+                major,
+                minor,
+                arb: arb_val,
+                messages,
+            })
         }
+        FileType::Mbn => {
+            if debug {
+                eprintln!("[DEBUG] Detected MBN file");
+            }
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            let mut full_data = Vec::new();
+            file.read_to_end(&mut full_data).map_err(|e| e.to_string())?;
+
+            if debug {
+                eprintln!("[DEBUG] Full MBN size: {} bytes", full_data.len());
+            }
+
+            let mbn = Mbn::from_bytes(&full_data)?;
+
+            if debug {
+                eprintln!("[DEBUG] MBN version: {}", mbn.header.version);
+                eprintln!("[DEBUG] Image ID: 0x{:x}", mbn.header.image_id);
+                eprintln!("[DEBUG] Code size: {}", mbn.header.code_size);
+                eprintln!("[DEBUG] Image size: {}", mbn.header.image_size);
+                eprintln!("[DEBUG] Signature ptr: 0x{:x}", mbn.header.sig_ptr);
+                eprintln!("[DEBUG] Signature size: {}", mbn.header.sig_size);
+                eprintln!("[DEBUG] Certificate chain ptr: 0x{:x}", mbn.header.cert_chain_ptr);
+                eprintln!("[DEBUG] Certificate chain size: {}", mbn.header.cert_chain_size);
+            }
+
+            let mut messages = Vec::new();
+
+            if full_mode {
+                messages.push(format!("File: {}", path));
+                messages.push(format!("Format: MBN v{}", mbn.header.version));
+                messages.push(format!("Image ID: 0x{:x}", mbn.header.image_id));
+                messages.push(format!("Code size: {} bytes", mbn.header.code_size));
+                messages.push(format!("Image size: {} bytes", mbn.header.image_size));
+                messages.push(format!("Signature ptr: 0x{:x}, size: {}", mbn.header.sig_ptr, mbn.header.sig_size));
+                messages.push(format!("Certificate chain ptr: 0x{:x}, size: {}", mbn.header.cert_chain_ptr, mbn.header.cert_chain_size));
+                messages.push("ARB: not applicable".to_string());
+            } else {
+                println!("MBN format does not contain ARB field");
+                messages.push("MBN format does not contain ARB field".to_string());
+            }
+
+            Ok(ExtractionResult {
+                major: 0,
+                minor: 0,
+                arb: 0,
+                messages,
+            })
+        }
+        FileType::Unknown => Err("Unknown file format (not ELF or MBN)".into()),
     }
 }
 
-// -----------------------------------------------------------------------------
-// Helper: get int field from Java object
-// -----------------------------------------------------------------------------
-fn get_int_field(env: &mut JNIEnv, obj: &JObject, field_name: &str) -> i32 {
-    env.get_field(obj, field_name, "I")
-        .expect("Failed to get int field")
-        .i()
-        .expect("Field is not an int")
-}
-
-// Helper: get long field from Java object
-fn get_long_field(env: &mut JNIEnv, obj: &JObject, field_name: &str) -> i64 {
-    env.get_field(obj, field_name, "J")
-        .expect("Failed to get long field")
-        .j()
-        .expect("Field is not a long")
-}
-
-// Helper: get boolean field from Java object
-fn get_boolean_field(env: &mut JNIEnv, obj: &JObject, field_name: &str) -> bool {
-    env.get_field(obj, field_name, "Z")
-        .expect("Failed to get boolean field")
-        .z()
-        .expect("Field is not a boolean")
-}
-
-// -----------------------------------------------------------------------------
-// JNI entry point with custom config (config may be null)
-// -----------------------------------------------------------------------------
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extractWithConfig(
-    mut env: JNIEnv,
-    _class: JClass,
-    path: JString,
-    debug: jboolean,
-    block_mode: jboolean,
-    config: JObject,
-) -> jobject {
-    // Convert Java parameters
-    let path_str: String = env
-        .get_string(&path)
-        .expect("Couldn't get Java string")
-        .into();
-    let debug = debug != 0;
-    let block_mode = block_mode != 0;
-
-    // Build Rust Config from Java object or use defaults
-    let rust_config = if config.is_null() {
-        Config::default()
-    } else {
-        Config {
-            hash_scan_max: get_int_field(&mut env, &config, "hashScanMax") as usize,
-            max_segment_size: get_long_field(&mut env, &config, "maxSegmentSize") as u64,
-            min_version: get_int_field(&mut env, &config, "minVersion") as u32,
-            max_version: get_int_field(&mut env, &config, "maxVersion") as u32,
-            max_common_sz: get_int_field(&mut env, &config, "maxCommonSz") as usize,
-            max_qti_sz: get_int_field(&mut env, &config, "maxQtiSz") as usize,
-            max_oem_sz: get_int_field(&mut env, &config, "maxOemSz") as usize,
-            max_hash_tbl_sz: get_int_field(&mut env, &config, "maxHashTblSz") as usize,
-            max_arb: get_int_field(&mut env, &config, "maxArb") as u32,
-            full_mode: get_boolean_field(&mut env, &config, "fullMode"),
-        }
-    };
-
-    // Perform extraction
-    let result = extract_metadata(&path_str, debug, block_mode, &rust_config);
-
-    // Find ArbResult class
+fn create_error_result<'local>(env: &mut JNIEnv<'local>, error_msg: &str) -> Result<JObject<'local>, String> {
     let arb_result_class = env
         .find_class("com/dere3046/arbinspector/ArbResult")
-        .expect("Failed to find ArbResult class");
-
-    // Create new ArbResult object
+        .map_err(|e| format!("Failed to find ArbResult class: {}", e))?;
     let arb_result = env
         .new_object(arb_result_class, "()V", &[])
-        .expect("Failed to create ArbResult object");
+        .map_err(|e| format!("Failed to create ArbResult object: {}", e))?;
 
-    // Macros for setting fields
-    macro_rules! set_int_field {
-        ($obj:expr, $name:expr, $value:expr) => {{
-            env.set_field(
-                $obj,
-                $name,
-                "I",
-                JValue::Int($value as jint),
-            ).unwrap();
-        }};
-    }
+    let jerr = env
+        .new_string(error_msg)
+        .map_err(|e| format!("Failed to create error string: {}", e))?;
+    env.set_field(&arb_result, "error", "Ljava/lang/String;", JValue::Object(&jerr))
+        .map_err(|e| format!("Failed to set error field: {}", e))?;
 
-    macro_rules! set_object_field {
-        ($obj:expr, $name:expr, $sig:expr, $value:expr) => {{
-            env.set_field(
-                $obj,
-                $name,
-                $sig,
-                JValue::Object($value),
-            ).unwrap();
-        }};
-    }
+    let array_list_class = env
+        .find_class("java/util/ArrayList")
+        .map_err(|e| format!("Failed to find ArrayList class: {}", e))?;
+    let array_list = env
+        .new_object(array_list_class, "()V", &[])
+        .map_err(|e| format!("Failed to create ArrayList: {}", e))?;
+    env.set_field(&arb_result, "debugMessages", "Ljava/util/List;", JValue::Object(&array_list))
+        .map_err(|e| format!("Failed to set debugMessages field: {}", e))?;
 
-    match result {
-        Ok((major, minor, arb, msgs)) => {
-            set_int_field!(&arb_result, "major", major);
-            set_int_field!(&arb_result, "minor", minor);
-            set_int_field!(&arb_result, "arb", arb);
-
-            // Create ArrayList<String> for messages
-            let array_list_class = env
-                .find_class("java/util/ArrayList")
-                .expect("Failed to find ArrayList class");
-            let array_list = env
-                .new_object(array_list_class, "()V", &[])
-                .expect("Failed to create ArrayList");
-
-            for msg in msgs {
-                let jmsg = env.new_string(msg).expect("Failed to create Java string");
-                env.call_method(
-                    &array_list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&*jmsg)],
-                )
-                .expect("Failed to add message");
-            }
-
-            set_object_field!(&arb_result, "debugMessages", "Ljava/util/List;", &array_list);
-            set_object_field!(&arb_result, "error", "Ljava/lang/String;", &JObject::null());
-        }
-        Err(err_msg) => {
-            let jerr = env
-                .new_string(err_msg)
-                .expect("Failed to create error string");
-            set_object_field!(&arb_result, "error", "Ljava/lang/String;", &*jerr);
-
-            // Empty list for debugMessages
-            let array_list_class = env
-                .find_class("java/util/ArrayList")
-                .expect("Failed to find ArrayList class");
-            let array_list = env
-                .new_object(array_list_class, "()V", &[])
-                .expect("Failed to create ArrayList");
-            set_object_field!(&arb_result, "debugMessages", "Ljava/util/List;", &array_list);
-        }
-    }
-
-    *arb_result
+    Ok(arb_result)
 }
 
-// -----------------------------------------------------------------------------
-// Legacy entry point (backward compatibility) – defaults to quick mode (fullMode = false)
-// -----------------------------------------------------------------------------
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract(
-    env: JNIEnv,
-    class: JClass,
-    path: JString,
+#[no_mangle]
+pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_getVersion<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let version = env!("CARGO_PKG_VERSION");
+    env.new_string(version).unwrap()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
     debug: jboolean,
     block_mode: jboolean,
 ) -> jobject {
-    Java_com_dere3046_arbinspector_ArbInspector_extractWithConfig(
-        env, class, path, debug, block_mode, JObject::null()
-    )
+    let result = (|| -> Result<JObject<'local>, String> {
+        let path_str: String = env.get_string(&path)
+            .map_err(|e| format!("Failed to get path string: {}", e))?
+            .into();
+        let debug = debug != 0;
+        let _block_mode = block_mode != 0;
+
+        let extraction = extract_arb_from_path(&path_str, false, debug)
+            .map_err(|e| e.to_string())?;
+
+        let arb_result_class = env
+            .find_class("com/dere3046/arbinspector/ArbResult")
+            .map_err(|e| format!("Failed to find ArbResult class: {}", e))?;
+        let arb_result = env
+            .new_object(arb_result_class, "()V", &[])
+            .map_err(|e| format!("Failed to create ArbResult object: {}", e))?;
+
+        env.set_field(&arb_result, "major", "I", JValue::Int(extraction.major as jint))
+            .map_err(|e| format!("Failed to set major field: {}", e))?;
+        env.set_field(&arb_result, "minor", "I", JValue::Int(extraction.minor as jint))
+            .map_err(|e| format!("Failed to set minor field: {}", e))?;
+        env.set_field(&arb_result, "arb", "I", JValue::Int(extraction.arb as jint))
+            .map_err(|e| format!("Failed to set arb field: {}", e))?;
+
+        let array_list_class = env
+            .find_class("java/util/ArrayList")
+            .map_err(|e| format!("Failed to find ArrayList class: {}", e))?;
+        let array_list = env
+            .new_object(array_list_class, "()V", &[])
+            .map_err(|e| format!("Failed to create ArrayList: {}", e))?;
+
+        for msg in extraction.messages {
+            let jmsg = env
+                .new_string(msg)
+                .map_err(|e| format!("Failed to create Java string: {}", e))?;
+            env.call_method(
+                &array_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&jmsg)],
+            )
+            .map_err(|e| format!("Failed to add message to list: {}", e))?;
+        }
+
+        env.set_field(&arb_result, "debugMessages", "Ljava/util/List;", JValue::Object(&array_list))
+            .map_err(|e| format!("Failed to set debugMessages field: {}", e))?;
+        env.set_field(&arb_result, "error", "Ljava/lang/String;", JValue::Object(&JObject::null()))
+            .map_err(|e| format!("Failed to set error field: {}", e))?;
+
+        Ok(arb_result)
+    })();
+
+    match result {
+        Ok(obj) => obj.as_raw(),
+        Err(err_msg) => {
+            match create_error_result(&mut env, &err_msg) {
+                Ok(err_obj) => err_obj.as_raw(),
+                Err(fatal) => panic!("Fatal JNI error: {}", fatal),
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extractWithMode<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
+    full_mode: jboolean,
+    debug: jboolean,
+) -> jobject {
+    let result = (|| -> Result<JObject<'local>, String> {
+        let path_str: String = env.get_string(&path)
+            .map_err(|e| format!("Failed to get path string: {}", e))?
+            .into();
+        let full_mode = full_mode != 0;
+        let debug = debug != 0;
+
+        let extraction = extract_arb_from_path(&path_str, full_mode, debug)
+            .map_err(|e| e.to_string())?;
+
+        let arb_result_class = env
+            .find_class("com/dere3046/arbinspector/ArbResult")
+            .map_err(|e| format!("Failed to find ArbResult class: {}", e))?;
+        let arb_result = env
+            .new_object(arb_result_class, "()V", &[])
+            .map_err(|e| format!("Failed to create ArbResult object: {}", e))?;
+
+        env.set_field(&arb_result, "major", "I", JValue::Int(extraction.major as jint))
+            .map_err(|e| format!("Failed to set major field: {}", e))?;
+        env.set_field(&arb_result, "minor", "I", JValue::Int(extraction.minor as jint))
+            .map_err(|e| format!("Failed to set minor field: {}", e))?;
+        env.set_field(&arb_result, "arb", "I", JValue::Int(extraction.arb as jint))
+            .map_err(|e| format!("Failed to set arb field: {}", e))?;
+
+        let array_list_class = env
+            .find_class("java/util/ArrayList")
+            .map_err(|e| format!("Failed to find ArrayList class: {}", e))?;
+        let array_list = env
+            .new_object(array_list_class, "()V", &[])
+            .map_err(|e| format!("Failed to create ArrayList: {}", e))?;
+
+        for msg in extraction.messages {
+            let jmsg = env
+                .new_string(msg)
+                .map_err(|e| format!("Failed to create Java string: {}", e))?;
+            env.call_method(
+                &array_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&jmsg)],
+            )
+            .map_err(|e| format!("Failed to add message to list: {}", e))?;
+        }
+
+        env.set_field(&arb_result, "debugMessages", "Ljava/util/List;", JValue::Object(&array_list))
+            .map_err(|e| format!("Failed to set debugMessages field: {}", e))?;
+        env.set_field(&arb_result, "error", "Ljava/lang/String;", JValue::Object(&JObject::null()))
+            .map_err(|e| format!("Failed to set error field: {}", e))?;
+
+        Ok(arb_result)
+    })();
+
+    match result {
+        Ok(obj) => obj.as_raw(),
+        Err(err_msg) => {
+            match create_error_result(&mut env, &err_msg) {
+                Ok(err_obj) => err_obj.as_raw(),
+                Err(fatal) => panic!("Fatal JNI error: {}", fatal),
+            }
+        }
+    }
 }

@@ -2,7 +2,7 @@
 name = "arb_inspector"
 version = "0.2.0"
 authors = ["Dere3046"]
-edition = "2024"
+edition = "2021"
 license = "MIT"
 description = "Extract OEM metadata (Major, Minor, Anti-Rollback) from xbl_config.img (JNI wrapper)"
 
