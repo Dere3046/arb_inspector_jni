@@ -1,5 +1,5 @@
 [package]
-name = "arb_inspector_jni"
+name = "arb_inspector"
 version = "0.3.0"
 authors = ["Dere3046"]
 edition = "2021"
