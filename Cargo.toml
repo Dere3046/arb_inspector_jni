@@ -1,6 +1,6 @@
 [package]
-name = "arb_inspector"
-version = "0.2.0"
+name = "arb_inspector_jni"
+version = "0.3.0"
 authors = ["Dere3046"]
 edition = "2021"
 license = "MIT"
@@ -11,3 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 jni = "0.21.1"
+sha2 = "0.10"
+digest = "0.10"
