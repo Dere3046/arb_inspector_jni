@@ -4,9 +4,10 @@ use std::io::{Read, Seek, SeekFrom};
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jobject};
 use jni::JNIEnv;
+use sha2::{Sha256, Digest};
 
 // ============================================================================
-// elf.rs constants (inlined from arb_inspector_next)
+// ELF constants (from elf.rs)
 // ============================================================================
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -48,8 +49,14 @@ const ELF64_PHDR_SIZE: usize = 56;
 const OS_TYPE_HASH: u32 = 0x2;
 
 // ============================================================================
-// hash_segment.rs constants (inlined from arb_inspector_next)
+// Hash segment constants (from hash_segment.rs)
 // ============================================================================
+
+const HASH_SEGMENT_V3: u32 = 3;
+const HASH_SEGMENT_V5: u32 = 5;
+const HASH_SEGMENT_V6: u32 = 6;
+const HASH_SEGMENT_V7: u32 = 7;
+const HASH_SEGMENT_V8: u32 = 8;
 
 const HASH_TABLE_HEADER_SIZE: usize = 40;
 const HASH_TABLE_HEADER_SIZE_V7: usize = 56;
@@ -63,6 +70,10 @@ const HASH_TABLE_SIZE_MAX: usize = 0x10000;
 const ARB_VALUE_MAX: u32 = 127;
 
 const SHA256_SIZE: usize = 32;
+
+// ============================================================================
+// MBN constants (from mbn.rs)
+// ============================================================================
 
 const MBN_HDR_SIZE: usize = 40;
 const MBN_V7_HDR_SIZE: usize = 64;
@@ -88,7 +99,87 @@ fn read_le_u64(buf: &[u8], off: usize) -> u64 {
 }
 
 // ============================================================================
-// metadata.rs (inlined from arb_inspector_next)
+// ELF helper functions (from elf.rs)
+// ============================================================================
+
+fn perm_to_string(perm: u32) -> &'static str {
+    match perm {
+        0x1 => "E",
+        0x2 => "W",
+        0x3 => "WE",
+        0x4 => "R",
+        0x5 => "RE",
+        0x6 => "RW",
+        0x7 => "RWE",
+        _ => "None",
+    }
+}
+
+#[inline]
+fn get_perm_value(flags: u32) -> u32 {
+    flags & PF_PERM_MASK
+}
+
+#[inline]
+fn get_os_segment_type(flags: u32) -> u32 {
+    (flags & PF_OS_SEGMENT_TYPE_MASK) >> 24
+}
+
+#[inline]
+fn get_os_access_type(flags: u32) -> u32 {
+    (flags & PF_OS_ACCESS_TYPE_MASK) >> 21
+}
+
+#[inline]
+fn get_os_page_mode(flags: u32) -> u32 {
+    (flags & PF_OS_PAGE_MODE_MASK) >> 20
+}
+
+fn os_segment_type_to_string(seg_type: u32) -> &'static str {
+    match seg_type {
+        PF_OS_SEGMENT_HASH => "HASH",
+        PF_OS_SEGMENT_PHDR => "PHDR",
+        0x0 => "L4",
+        0x1 => "AMSS",
+        0x3 => "BOOT",
+        0x4 => "L4BSP",
+        0x5 => "SWAPPED",
+        0x6 => "SWAP_POOL",
+        _ => "Unknown",
+    }
+}
+
+fn os_access_type_to_string(access_type: u32) -> &'static str {
+    match access_type {
+        PF_OS_ACCESS_RW => "RW",
+        PF_OS_ACCESS_RO => "RO",
+        PF_OS_ACCESS_ZI => "ZI",
+        PF_OS_ACCESS_NOTUSED => "NOTUSED",
+        PF_OS_ACCESS_SHARED => "SHARED",
+        _ => "Unknown",
+    }
+}
+
+fn os_page_mode_to_string(page_mode: u32) -> &'static str {
+    match page_mode {
+        PF_OS_NON_PAGED_SEGMENT => "NON_PAGED",
+        PF_OS_PAGED_SEGMENT => "PAGED",
+        _ => "Unknown",
+    }
+}
+
+fn p_type_to_string(p_type: u32) -> &'static str {
+    match p_type {
+        PT_NULL => "NULL",
+        PT_LOAD => "LOAD",
+        PT_NOTE => "NOTE",
+        PT_PHDR => "PHDR",
+        _ => "OTHER",
+    }
+}
+
+// ============================================================================
+// Metadata types (from metadata.rs)
 // ============================================================================
 
 #[derive(Debug, Clone)]
@@ -424,7 +515,7 @@ impl CommonMetadata {
 }
 
 // ============================================================================
-// mbn.rs (inlined from arb_inspector_next)
+// MBN types (from mbn.rs)
 // ============================================================================
 
 #[derive(Debug, Clone)]
@@ -491,7 +582,7 @@ impl Mbn {
 }
 
 // ============================================================================
-// HashTableSegmentHeader & ElfWithHashTable (core logic from arb_inspector_next)
+// HashTableSegmentHeader & ElfWithHashTable (core logic)
 // ============================================================================
 
 #[derive(Debug, Clone)]
@@ -558,7 +649,7 @@ struct ElfInfo {
     e_type: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProgramHeaderInfo {
     p_type: u32,
     p_flags: u32,
@@ -582,82 +673,6 @@ struct ElfWithHashTable {
     elf_info: ElfInfo,
     program_headers: Vec<ProgramHeaderInfo>,
     hash_table_info: Option<HashTableInfo>,
-}
-
-#[inline]
-fn get_os_segment_type(flags: u32) -> u32 {
-    (flags & PF_OS_SEGMENT_TYPE_MASK) >> 24
-}
-
-#[inline]
-fn get_os_access_type(flags: u32) -> u32 {
-    (flags & PF_OS_ACCESS_TYPE_MASK) >> 21
-}
-
-#[inline]
-fn get_os_page_mode(flags: u32) -> u32 {
-    (flags & PF_OS_PAGE_MODE_MASK) >> 20
-}
-
-#[inline]
-fn get_perm_value(flags: u32) -> u32 {
-    flags & PF_PERM_MASK
-}
-
-fn perm_to_string(perm: u32) -> &'static str {
-    match perm {
-        0x1 => "E",
-        0x2 => "W",
-        0x3 => "WE",
-        0x4 => "R",
-        0x5 => "RE",
-        0x6 => "RW",
-        0x7 => "RWE",
-        _ => "None",
-    }
-}
-
-fn os_segment_type_to_string(seg_type: u32) -> &'static str {
-    match seg_type {
-        PF_OS_SEGMENT_HASH => "HASH",
-        PF_OS_SEGMENT_PHDR => "PHDR",
-        0x0 => "L4",
-        0x1 => "AMSS",
-        0x3 => "BOOT",
-        0x4 => "L4BSP",
-        0x5 => "SWAPPED",
-        0x6 => "SWAP_POOL",
-        _ => "Unknown",
-    }
-}
-
-fn os_access_type_to_string(access_type: u32) -> &'static str {
-    match access_type {
-        PF_OS_ACCESS_RW => "RW",
-        PF_OS_ACCESS_RO => "RO",
-        PF_OS_ACCESS_ZI => "ZI",
-        PF_OS_ACCESS_NOTUSED => "NOTUSED",
-        PF_OS_ACCESS_SHARED => "SHARED",
-        _ => "Unknown",
-    }
-}
-
-fn os_page_mode_to_string(page_mode: u32) -> &'static str {
-    match page_mode {
-        PF_OS_NON_PAGED_SEGMENT => "NON_PAGED",
-        PF_OS_PAGED_SEGMENT => "PAGED",
-        _ => "Unknown",
-    }
-}
-
-fn p_type_to_string(p_type: u32) -> &'static str {
-    match p_type {
-        PT_NULL => "NULL",
-        PT_LOAD => "LOAD",
-        PT_NOTE => "NOTE",
-        PT_PHDR => "PHDR",
-        _ => "OTHER",
-    }
 }
 
 impl ElfWithHashTable {
@@ -720,7 +735,6 @@ impl ElfWithHashTable {
                     let p_filesz = read_le_u32(data, offset + 16);
                     let p_memsz = read_le_u32(data, offset + 20);
                     let p_flags = read_le_u32(data, offset + 24);
-                    let p_align = read_le_u32(data, offset + 28);
                     ProgramHeaderInfo {
                         p_type,
                         p_flags,
@@ -742,7 +756,6 @@ impl ElfWithHashTable {
                     let p_paddr = read_le_u64(data, offset + 24);
                     let p_filesz = read_le_u64(data, offset + 32);
                     let p_memsz = read_le_u64(data, offset + 40);
-                    let p_align = read_le_u64(data, offset + 48);
                     ProgramHeaderInfo {
                         p_type,
                         p_flags,
@@ -903,6 +916,88 @@ impl ElfWithHashTable {
             .as_ref()
             .and_then(|ht| ht.oem_metadata.as_ref().map(|m| m.get_arb_version()))
     }
+
+    fn compute_segment_hashes(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+        let mut hashes = Vec::new();
+
+        for phdr in &self.program_headers {
+            let flags = phdr.p_flags;
+            let os_seg_type = get_os_segment_type(flags);
+            let os_access = get_os_access_type(flags);
+            let os_page_mode = get_os_page_mode(flags);
+
+            // Skip HASH segment itself
+            if os_seg_type == PF_OS_SEGMENT_HASH {
+                continue;
+            }
+
+            // NOTUSED or SHARED access type -> empty hash
+            if os_access == PF_OS_ACCESS_NOTUSED || os_access == PF_OS_ACCESS_SHARED {
+                hashes.push(vec![0u8; SHA256_SIZE]);
+                continue;
+            }
+
+            // filesz == 0 -> empty hash
+            if phdr.p_filesz == 0 {
+                hashes.push(vec![0u8; SHA256_SIZE]);
+                continue;
+            }
+
+            // Get segment data
+            let seg_data = if phdr.p_type == PT_PHDR {
+                let start = self.elf_info.e_phoff as usize;
+                let end = start + (self.elf_info.e_phnum as usize * self.elf_info.e_phentsize as usize);
+                if end <= data.len() {
+                    &data[start..end]
+                } else {
+                    &[]
+                }
+            } else {
+                let start = phdr.p_offset as usize;
+                let end = start + phdr.p_filesz as usize;
+                if end <= data.len() {
+                    &data[start..end]
+                } else {
+                    &[]
+                }
+            };
+
+            // Compute hash based on page mode
+            if os_page_mode == PF_OS_NON_PAGED_SEGMENT {
+                let hash = compute_sha256(seg_data);
+                hashes.push(hash);
+            } else if os_page_mode == PF_OS_PAGED_SEGMENT {
+                let mut offset = 0;
+                let nonalign = phdr.p_vaddr & (ELF_BLOCK_ALIGN - 1);
+                if nonalign != 0 {
+                    offset = (ELF_BLOCK_ALIGN - nonalign) as usize;
+                }
+
+                let mut page_data = seg_data;
+                if offset < page_data.len() {
+                    page_data = &page_data[offset..];
+                }
+
+                while page_data.len() >= ELF_BLOCK_ALIGN as usize {
+                    let hash = compute_sha256(&page_data[..ELF_BLOCK_ALIGN as usize]);
+                    hashes.push(hash);
+                    page_data = &page_data[ELF_BLOCK_ALIGN as usize..];
+                }
+            }
+        }
+
+        Ok(hashes)
+    }
+}
+
+// ============================================================================
+// SHA256 helper
+// ============================================================================
+
+fn compute_sha256(data: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
 }
 
 // ============================================================================
@@ -931,23 +1026,15 @@ fn detect_file_type(data: &[u8]) -> FileType {
 }
 
 // ============================================================================
-// Extraction logic
+// Core extraction function
 // ============================================================================
 
-struct ExtractionResult {
-    major: u32,
-    minor: u32,
-    arb: u32,
-    messages: Vec<String>,
-}
-
-fn extract_arb_from_path(
+fn extract_metadata(
     path: &str,
     full_mode: bool,
     debug: bool,
-) -> Result<ExtractionResult, String> {
-    let mut file =
-        File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+) -> Result<(u32, u32, u32, Vec<String>), String> {
+    let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
     let file_size = file
         .metadata()
         .map_err(|e| format!("Failed to get file size: {}", e))?
@@ -962,10 +1049,6 @@ fn extract_arb_from_path(
 
     match detect_file_type(&header_buf) {
         FileType::Elf => {
-            if debug {
-                eprintln!("[DEBUG] Detected ELF file");
-            }
-
             if header_buf[EI_DATA] != ELFDATA2LSB {
                 return Err("Not a little-endian ELF file".into());
             }
@@ -978,11 +1061,7 @@ fn extract_arb_from_path(
             if debug {
                 eprintln!(
                     "[DEBUG] ELF class: {}",
-                    if elf_class == ELFCLASS32 {
-                        "32-bit"
-                    } else {
-                        "64-bit"
-                    }
+                    if elf_class == ELFCLASS32 { "32-bit" } else { "64-bit" }
                 );
             }
 
@@ -998,22 +1077,10 @@ fn extract_arb_from_path(
             let elf_with_hash = ElfWithHashTable::from_bytes(&full_data)?;
 
             if debug {
-                eprintln!(
-                    "[DEBUG] ELF entry: 0x{:x}",
-                    elf_with_hash.elf_info.e_entry
-                );
-                eprintln!(
-                    "[DEBUG] Program header offset: 0x{:x}",
-                    elf_with_hash.elf_info.e_phoff
-                );
-                eprintln!(
-                    "[DEBUG] Program header count: {}",
-                    elf_with_hash.elf_info.e_phnum
-                );
-                eprintln!(
-                    "[DEBUG] Program header size: {} bytes",
-                    elf_with_hash.elf_info.e_phentsize
-                );
+                eprintln!("[DEBUG] ELF entry: 0x{:x}", elf_with_hash.elf_info.e_entry);
+                eprintln!("[DEBUG] Program header offset: 0x{:x}", elf_with_hash.elf_info.e_phoff);
+                eprintln!("[DEBUG] Program header count: {}", elf_with_hash.elf_info.e_phnum);
+                eprintln!("[DEBUG] Program header size: {} bytes", elf_with_hash.elf_info.e_phentsize);
 
                 for (i, ph) in elf_with_hash.program_headers.iter().enumerate() {
                     let flags = ph.p_flags;
@@ -1033,6 +1100,21 @@ fn extract_arb_from_path(
                         os_page_mode_to_string(os_page)
                     );
                 }
+
+                // Debug: compute segment hashes
+                match elf_with_hash.compute_segment_hashes(&full_data) {
+                    Ok(computed_hashes) => {
+                        eprintln!("[DEBUG] Computed {} segment hashes:", computed_hashes.len());
+                        for (i, h) in computed_hashes.iter().enumerate() {
+                            eprintln!(
+                                "[DEBUG]   Hash[{}]: {}",
+                                i,
+                                h.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("[DEBUG] Failed to compute segment hashes: {}", e),
+                }
             }
 
             let arb = elf_with_hash.get_arb_version();
@@ -1049,10 +1131,7 @@ fn extract_arb_from_path(
                         "[DEBUG]   oem_metadata_size: {}",
                         ht.header.oem_metadata_size
                     );
-                    eprintln!(
-                        "[DEBUG]   hash_table_size: {}",
-                        ht.header.hash_table_size
-                    );
+                    eprintln!("[DEBUG]   hash_table_size: {}", ht.header.hash_table_size);
                 } else {
                     eprintln!("[DEBUG] No HASH segment header found");
                 }
@@ -1116,6 +1195,10 @@ fn extract_arb_from_path(
                         ht.header.common_metadata_size
                     ));
                     messages.push(format!(
+                        "  QTI Metadata Size: {}",
+                        ht.header.qti_metadata_size
+                    ));
+                    messages.push(format!(
                         "  OEM Metadata Size: {}",
                         ht.header.oem_metadata_size
                     ));
@@ -1123,18 +1206,209 @@ fn extract_arb_from_path(
                         "  Hash Table Size: {}",
                         ht.header.hash_table_size
                     ));
+                    messages.push(format!(
+                        "  QTI Signature Size: {}",
+                        ht.header.qti_sig_size
+                    ));
+                    messages.push(format!(
+                        "  QTI Cert Chain Size: {}",
+                        ht.header.qti_cert_chain_size
+                    ));
+                    messages.push(format!(
+                        "  OEM Signature Size: {}",
+                        ht.header.oem_sig_size
+                    ));
+                    messages.push(format!(
+                        "  OEM Cert Chain Size: {}",
+                        ht.header.oem_cert_chain_size
+                    ));
 
                     if let Some(ref cm) = ht.common_metadata {
                         messages.push(format!(
                             "  Common Metadata Version: {}",
                             cm.get_version_string()
                         ));
+                        match cm {
+                            CommonMetadata::V00(m) => {
+                                messages.push(format!(
+                                    "    One-shot Hash Algorithm: {}",
+                                    m.one_shot_hash_algorithm
+                                ));
+                                messages.push(format!(
+                                    "    Segment Hash Algorithm: {}",
+                                    m.segment_hash_algorithm
+                                ));
+                            }
+                            CommonMetadata::V01(m) => {
+                                messages.push(format!(
+                                    "    One-shot Hash Algorithm: {}",
+                                    m.base.one_shot_hash_algorithm
+                                ));
+                                messages.push(format!(
+                                    "    Segment Hash Algorithm: {}",
+                                    m.base.segment_hash_algorithm
+                                ));
+                                messages.push(format!(
+                                    "    ZI Segment Hash Algorithm: {}",
+                                    m.zi_segment_hash_algorithm
+                                ));
+                            }
+                        }
                     }
                     if let Some(ref om) = ht.oem_metadata {
                         messages.push(format!(
                             "  OEM Metadata Version: {}",
                             om.get_version_string()
                         ));
+                        messages.push(format!(
+                            "  OEM Anti-Rollback Version: {}",
+                            om.get_arb_version()
+                        ));
+                        match om {
+                            Metadata::V00(m) => {
+                                messages.push(format!("    Software ID: 0x{:x}", m.software_id));
+                                messages.push(format!("    OEM ID: 0x{:x}", m.oem_id));
+                                messages.push(format!(
+                                    "    OEM Product ID: 0x{:x}",
+                                    m.oem_product_id
+                                ));
+                                messages.push(format!("    MRC Index: {}", m.mrc_index));
+                                messages.push(format!("    Debug: {}", m.debug));
+                                messages.push(format!(
+                                    "    Secondary Software ID: 0x{:x}",
+                                    m.secondary_software_id
+                                ));
+                                messages.push(format!("    Flags: 0x{:x}", m.flags));
+                            }
+                            Metadata::V10(m) => {
+                                messages.push(format!(
+                                    "    Software ID: 0x{:x}",
+                                    m.base.software_id
+                                ));
+                                messages.push(format!("    OEM ID: 0x{:x}", m.base.oem_id));
+                                messages.push(format!(
+                                    "    OEM Product ID: 0x{:x}",
+                                    m.base.oem_product_id
+                                ));
+                                messages.push(format!("    MRC Index: {}", m.base.mrc_index));
+                                messages.push(format!("    Debug: {}", m.base.debug));
+                                messages.push(format!(
+                                    "    Secondary Software ID: 0x{:x}",
+                                    m.base.secondary_software_id
+                                ));
+                                messages.push(format!("    Flags: 0x{:x}", m.base.flags));
+                                messages.push(format!(
+                                    "    In-use JTAG ID: {}",
+                                    m.in_use_jtag_id
+                                ));
+                                messages.push(format!(
+                                    "    OEM Product ID Independent: {}",
+                                    m.oem_product_id_independent
+                                ));
+                            }
+                            Metadata::V20(m) => {
+                                messages.push(format!(
+                                    "    SoC Feature ID: 0x{:x}",
+                                    m.soc_feature_id
+                                ));
+                                messages.push(format!("    OEM ID: 0x{:x}", m.oem_id));
+                                messages.push(format!(
+                                    "    OEM Product ID: 0x{:x}",
+                                    m.oem_product_id
+                                ));
+                                messages.push(format!("    MRC Index: {}", m.mrc_index));
+                                messages.push(format!(
+                                    "    SoC Lifecycle State: {}",
+                                    m.soc_lifecycle_state
+                                ));
+                                messages.push(format!(
+                                    "    OEM Lifecycle State: {}",
+                                    m.oem_lifecycle_state
+                                ));
+                                messages.push(format!(
+                                    "    OEM Root Cert Hash Algo: {}",
+                                    m.oem_root_certificate_hash_algorithm
+                                ));
+                                messages.push(format!("    Flags: 0x{:x}", m.flags));
+                            }
+                            Metadata::V30(m) => {
+                                messages.push(format!(
+                                    "    SoC Feature ID: 0x{:x}",
+                                    m.base.soc_feature_id
+                                ));
+                                messages.push(format!("    OEM ID: 0x{:x}", m.base.oem_id));
+                                messages.push(format!(
+                                    "    OEM Product ID: 0x{:x}",
+                                    m.base.oem_product_id
+                                ));
+                                messages.push(format!("    MRC Index: {}", m.base.mrc_index));
+                                messages.push(format!(
+                                    "    SoC Lifecycle State: {}",
+                                    m.base.soc_lifecycle_state
+                                ));
+                                messages.push(format!(
+                                    "    OEM Lifecycle State: {}",
+                                    m.base.oem_lifecycle_state
+                                ));
+                                messages.push(format!(
+                                    "    QTI Lifecycle State: {}",
+                                    m.qti_lifecycle_state
+                                ));
+                                messages.push(format!("    Flags: 0x{:x}", m.base.flags));
+                            }
+                            Metadata::V31(m) => {
+                                messages.push(format!(
+                                    "    SoC Feature ID: 0x{:x}",
+                                    m.base.base.soc_feature_id
+                                ));
+                                messages.push(format!(
+                                    "    OEM ID: 0x{:x}",
+                                    m.base.base.oem_id
+                                ));
+                                messages.push(format!(
+                                    "    OEM Product ID: 0x{:x}",
+                                    m.base.base.oem_product_id
+                                ));
+                                messages.push(format!(
+                                    "    MRC Index: {}",
+                                    m.base.base.mrc_index
+                                ));
+                                messages.push(format!(
+                                    "    SoC Lifecycle State: {}",
+                                    m.base.base.soc_lifecycle_state
+                                ));
+                                messages.push(format!(
+                                    "    OEM Lifecycle State: {}",
+                                    m.base.base.oem_lifecycle_state
+                                ));
+                                messages.push(format!(
+                                    "    QTI Lifecycle State: {}",
+                                    m.base.qti_lifecycle_state
+                                ));
+                                messages.push(format!(
+                                    "    Measurement Register Target: {}",
+                                    m.measurement_register_target
+                                ));
+                                messages.push(format!(
+                                    "    Flags: 0x{:x}",
+                                    m.base.base.flags
+                                ));
+                            }
+                        }
+                    }
+
+                    if ht.serial_num.is_some() || !ht.hashes.is_empty() {
+                        if let Some(serial) = ht.serial_num {
+                            messages.push(format!("  Serial Number: {}", serial));
+                        }
+                        for (idx, hash) in ht.hashes.iter().enumerate() {
+                            let hash_hex: String = hash
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join("");
+                            messages.push(format!("  Hash[{}]: {}", idx, hash_hex));
+                        }
                     }
                 }
 
@@ -1154,26 +1428,12 @@ fn extract_arb_from_path(
             }
 
             let (major, minor, arb_val) = if let Some(arb_val) = arb {
-                if full_mode && arb_val > ARB_VALUE_MAX {
-                    eprintln!(
-                        "Warning: ARB value {} exceeds expected maximum.",
-                        arb_val
-                    );
-                }
                 (0, 0, arb_val)
             } else {
-                if !full_mode {
-                    eprintln!("No ARB version found in the image");
-                }
                 (0, 0, 0)
             };
 
-            Ok(ExtractionResult {
-                major,
-                minor,
-                arb: arb_val,
-                messages,
-            })
+            Ok((major, minor, arb_val, messages))
         }
         FileType::Mbn => {
             if debug {
@@ -1195,10 +1455,7 @@ fn extract_arb_from_path(
                 eprintln!("[DEBUG] Image ID: 0x{:x}", mbn.header.image_id);
                 eprintln!("[DEBUG] Code size: {}", mbn.header.code_size);
                 eprintln!("[DEBUG] Image size: {}", mbn.header.image_size);
-                eprintln!(
-                    "[DEBUG] Signature ptr: 0x{:x}",
-                    mbn.header.sig_ptr
-                );
+                eprintln!("[DEBUG] Signature ptr: 0x{:x}", mbn.header.sig_ptr);
                 eprintln!("[DEBUG] Signature size: {}", mbn.header.sig_size);
                 eprintln!(
                     "[DEBUG] Certificate chain ptr: 0x{:x}",
@@ -1217,10 +1474,7 @@ fn extract_arb_from_path(
                 messages.push(format!("Format: MBN v{}", mbn.header.version));
                 messages.push(format!("Image ID: 0x{:x}", mbn.header.image_id));
                 messages.push(format!("Code size: {} bytes", mbn.header.code_size));
-                messages.push(format!(
-                    "Image size: {} bytes",
-                    mbn.header.image_size
-                ));
+                messages.push(format!("Image size: {} bytes", mbn.header.image_size));
                 messages.push(format!(
                     "Signature ptr: 0x{:x}, size: {}",
                     mbn.header.sig_ptr, mbn.header.sig_size
@@ -1234,12 +1488,7 @@ fn extract_arb_from_path(
                 messages.push("MBN format does not contain ARB field".to_string());
             }
 
-            Ok(ExtractionResult {
-                major: 0,
-                minor: 0,
-                arb: 0,
-                messages,
-            })
+            Ok((0, 0, 0, messages))
         }
         FileType::Unknown => Err("Unknown file format (not ELF or MBN)".into()),
     }
@@ -1289,24 +1538,19 @@ fn create_error_result<'local>(
 }
 
 // ============================================================================
-// JNI entry points (signatures unchanged)
+// JNI entry points
 // ============================================================================
 
 #[no_mangle]
-pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_getVersion<
-    'local,
->(
+pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_getVersion<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
-    let version = env!("CARGO_PKG_VERSION");
-    env.new_string(version).unwrap()
+    env.new_string("0.3.0").unwrap()
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract<
-    'local,
->(
+pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     path: JString<'local>,
@@ -1322,7 +1566,7 @@ pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract<
             .into();
         let debug = debug != 0;
 
-        let extraction = extract_arb_from_path(&path_str, false, debug)?;
+        let (major, minor, arb, messages) = extract_metadata(&path_str, false, debug)?;
 
         let arb_result_class = env
             .find_class("com/dere3046/arbinspector/ArbResult")
@@ -1335,21 +1579,21 @@ pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract<
             &arb_result,
             "major",
             "I",
-            JValue::Int(extraction.major as jint),
+            JValue::Int(major as jint),
         )
         .map_err(|e| format!("Failed to set major field: {}", e))?;
         env.set_field(
             &arb_result,
             "minor",
             "I",
-            JValue::Int(extraction.minor as jint),
+            JValue::Int(minor as jint),
         )
         .map_err(|e| format!("Failed to set minor field: {}", e))?;
         env.set_field(
             &arb_result,
             "arb",
             "I",
-            JValue::Int(extraction.arb as jint),
+            JValue::Int(arb as jint),
         )
         .map_err(|e| format!("Failed to set arb field: {}", e))?;
 
@@ -1360,7 +1604,7 @@ pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract<
             .new_object(array_list_class, "()V", &[])
             .map_err(|e| format!("Failed to create ArrayList: {}", e))?;
 
-        for msg in extraction.messages {
+        for msg in messages {
             let jmsg = env
                 .new_string(&msg)
                 .map_err(|e| format!("Failed to create Java string: {}", e))?;
@@ -1401,9 +1645,7 @@ pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extract<
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extractWithMode<
-    'local,
->(
+pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extractWithMode<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     path: JString<'local>,
@@ -1418,7 +1660,7 @@ pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extractWithMo
         let full_mode = full_mode != 0;
         let debug = debug != 0;
 
-        let extraction = extract_arb_from_path(&path_str, full_mode, debug)?;
+        let (major, minor, arb, messages) = extract_metadata(&path_str, full_mode, debug)?;
 
         let arb_result_class = env
             .find_class("com/dere3046/arbinspector/ArbResult")
@@ -1431,21 +1673,21 @@ pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extractWithMo
             &arb_result,
             "major",
             "I",
-            JValue::Int(extraction.major as jint),
+            JValue::Int(major as jint),
         )
         .map_err(|e| format!("Failed to set major field: {}", e))?;
         env.set_field(
             &arb_result,
             "minor",
             "I",
-            JValue::Int(extraction.minor as jint),
+            JValue::Int(minor as jint),
         )
         .map_err(|e| format!("Failed to set minor field: {}", e))?;
         env.set_field(
             &arb_result,
             "arb",
             "I",
-            JValue::Int(extraction.arb as jint),
+            JValue::Int(arb as jint),
         )
         .map_err(|e| format!("Failed to set arb field: {}", e))?;
 
@@ -1456,7 +1698,7 @@ pub extern "system" fn Java_com_dere3046_arbinspector_ArbInspector_extractWithMo
             .new_object(array_list_class, "()V", &[])
             .map_err(|e| format!("Failed to create ArrayList: {}", e))?;
 
-        for msg in extraction.messages {
+        for msg in messages {
             let jmsg = env
                 .new_string(&msg)
                 .map_err(|e| format!("Failed to create Java string: {}", e))?;
