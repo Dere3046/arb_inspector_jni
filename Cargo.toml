@@ -1,15 +1,15 @@
 [package]
-name = "arb_inspector"
-version = "0.3.0"
+name = "arb_inspector_jni"
+version = "0.4.0"
 authors = ["Dere3046"]
 edition = "2021"
 license = "MIT"
 description = "Extract OEM metadata (Major, Minor, Anti-Rollback) from xbl_config.img (JNI wrapper)"
 
 [lib]
+name = "arb_inspector"
 crate-type = ["cdylib"]
 
 [dependencies]
 jni = "0.21.1"
-sha2 = "0.10"
-digest = "0.10"
+arb_inspector_lib = { package = "arb_inspector", path = "arb_inspector", features = ["inspect"] }
