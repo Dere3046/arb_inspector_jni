@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 jni = "0.21.1"
-arb_inspector_lib = { package = "arb_inspector", path = "arb_inspector", features = ["inspect"] }
+arb_inspector_lib = { package = "arb_inspector", path = "arb_inspector", default-features = false, features = ["inspect"] }
